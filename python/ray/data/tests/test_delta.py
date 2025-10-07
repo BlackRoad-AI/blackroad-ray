@@ -55,9 +55,9 @@ class DeltaTestValidator:
         df: pd.DataFrame, expected_count: int, id_column: str = "id"
     ) -> None:
         """Validate data integrity with comprehensive checks."""
-        assert len(df) == expected_count, (
-            f"Expected {expected_count} rows, got {len(df)}"
-        )
+        assert (
+            len(df) == expected_count
+        ), f"Expected {expected_count} rows, got {len(df)}"
 
         if id_column in df.columns:
             # Check for duplicates
@@ -88,9 +88,9 @@ class DeltaTestValidator:
         """Validate performance meets minimum thresholds."""
         if operation_time > 0:
             throughput = record_count / operation_time
-            assert throughput >= min_throughput, (
-                f"Throughput {throughput:.0f} records/sec below minimum {min_throughput}"
-            )
+            assert (
+                throughput >= min_throughput
+            ), f"Throughput {throughput:.0f} records/sec below minimum {min_throughput}"
 
     @staticmethod
     def create_test_data(
@@ -230,9 +230,9 @@ def test_delta_read_basic(data_path, batch_size, write_mode):
 
     # Comprehensive validation
     actual_count = ds.count()
-    assert actual_count == expected_count, (
-        f"Expected {expected_count} rows, got {actual_count}"
-    )
+    assert (
+        actual_count == expected_count
+    ), f"Expected {expected_count} rows, got {actual_count}"
 
     # Schema validation
 
@@ -328,9 +328,9 @@ def test_delta_write_partitioned(data_path, batch_size, write_mode):
     # Comprehensive validation
     expected_rows = batch_size if write_mode == "overwrite" else batch_size * 2
     actual_rows = res_ds.count()
-    assert actual_rows == expected_rows, (
-        f"Expected {expected_rows} rows, got {actual_rows}"
-    )
+    assert (
+        actual_rows == expected_rows
+    ), f"Expected {expected_rows} rows, got {actual_rows}"
 
     # Schema validation - ensure all columns are preserved
     expected_columns = {
@@ -344,9 +344,9 @@ def test_delta_write_partitioned(data_path, batch_size, write_mode):
         "nullable_col",
     }
     actual_columns = set(res_ds.schema().names)
-    assert actual_columns == expected_columns, (
-        f"Schema mismatch. Expected: {expected_columns}, Got: {actual_columns}"
-    )
+    assert (
+        actual_columns == expected_columns
+    ), f"Schema mismatch. Expected: {expected_columns}, Got: {actual_columns}"
 
     # Data integrity validation
     all_rows = res_ds.take_all()
@@ -378,9 +378,9 @@ def test_delta_write_partitioned(data_path, batch_size, write_mode):
                         year_dirs = [
                             d for d in os.listdir(part_path) if d.startswith("year=")
                         ]
-                        assert len(year_dirs) > 0, (
-                            f"No year partitions found in {part_dir}"
-                        )
+                        assert (
+                            len(year_dirs) > 0
+                        ), f"No year partitions found in {part_dir}"
     except OSError:
         # Directory listing might fail in some environments, that's OK
         pass
@@ -398,9 +398,9 @@ def test_delta_write_partitioned(data_path, batch_size, write_mode):
     expected_nulls = len([i for i in range(batch_size) if i % 3 == 0])
     if write_mode == "append":
         expected_nulls *= 2
-    assert null_count == expected_nulls, (
-        f"Expected {expected_nulls} nulls, got {null_count}"
-    )
+    assert (
+        null_count == expected_nulls
+    ), f"Expected {expected_nulls} nulls, got {null_count}"
 
     # Performance validation (relaxed thresholds for small datasets)
     if batch_size >= 100:
