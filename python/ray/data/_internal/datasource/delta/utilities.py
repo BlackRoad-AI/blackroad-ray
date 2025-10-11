@@ -29,13 +29,13 @@ def convert_pyarrow_filter_to_sql(
 
     Examples:
         >>> convert_pyarrow_filter_to_sql([("year", "=", "2024")])
-        "year = '2024'"
+        'year = \\'2024\\''
         >>> convert_pyarrow_filter_to_sql([("age", ">", 18)])
-        "age > 18"
+        'age > 18'
         >>> convert_pyarrow_filter_to_sql([("id", "in", [1, 2, 3])])
-        "id IN (1, 2, 3)"
+        'id IN (1, 2, 3)'
         >>> convert_pyarrow_filter_to_sql([(("year", "=", 2024), ("month", ">", 6))])
-        "(year = 2024 AND month > 6)"
+        '(year = 2024 AND month > 6)'
     """
     if not filters:
         return None

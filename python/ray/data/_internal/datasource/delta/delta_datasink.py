@@ -58,6 +58,7 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         self.partition_cols = partition_cols or []
         self.schema = schema
         self.write_kwargs = write_kwargs
+        self._skip_write = False
 
         # Initialize Delta utilities
         self.delta_utils = DeltaUtilities(
@@ -102,15 +103,16 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
                 f"Use mode='append' or 'overwrite'."
             )
         
-        # For IGNORE mode, fail immediately if table exists to prevent wasted computation
-        # Note: This is a deliberate early exit to save I/O operations
+        # For IGNORE mode, skip write if table exists to prevent wasted computation
+        # Note: This is handled by setting _skip_write flag that write() will check
         if self.mode == WriteMode.IGNORE and existing_table:
-            # We raise a special exception that should be caught and handled gracefully
-            # by the calling code to skip the write entirely
-            raise FileExistsError(
+            logger.info(
                 f"Delta table already exists at {self.path}. "
                 f"Skipping write due to mode='ignore'."
             )
+            self._skip_write = True
+        else:
+            self._skip_write = False
 
     def write(
         self,
@@ -127,6 +129,9 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         Returns:
             List of AddAction objects for written files
         """
+        if self._skip_write:
+            return []
+        
         _check_import(self, module="deltalake", package="deltalake")
 
         # Convert blocks to PyArrow tables
