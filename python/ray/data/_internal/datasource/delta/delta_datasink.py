@@ -171,30 +171,24 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
 
     def _validate_table_schema(self, table: pa.Table) -> None:
         """Validate table schema matches expected schema if provided."""
-        if self.schema:
-            # Check column names match
-            table_cols = set(table.column_names)
-            schema_cols = set(self.schema.names)
-            missing_cols = schema_cols - table_cols
+        if not self.schema:
+            return
 
-            if missing_cols:
-                raise ValueError(
-                    f"Table missing required columns from schema: {sorted(missing_cols)}. "
-                    f"Table columns: {sorted(table_cols)}"
-                )
+        table_cols = set(table.column_names)
+        schema_cols = set(self.schema.names)
+        missing = schema_cols - table_cols
+        if missing:
+            raise ValueError(
+                f"Missing columns: {sorted(missing)}. Table has: {sorted(table_cols)}"
+            )
 
-            # Validate types match for common columns (excluding partition cols)
-            for field in self.schema:
-                if (
-                    field.name in table.column_names
-                    and field.name not in self.partition_cols
-                ):
-                    table_type = table[field.name].type
-                    if not self._types_compatible(field.type, table_type):
-                        raise ValueError(
-                            f"Type mismatch for column '{field.name}': "
-                            f"schema expects {field.type}, table has {table_type}"
-                        )
+        for field in self.schema:
+            if field.name in table_cols and field.name not in self.partition_cols:
+                if not self._types_compatible(field.type, table[field.name].type):
+                    raise ValueError(
+                        f"Type mismatch for '{field.name}': expected {field.type}, "
+                        f"got {table[field.name].type}"
+                    )
 
     def _types_compatible(
         self, expected_type: pa.DataType, actual_type: pa.DataType
@@ -224,20 +218,15 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         """Validate that all partition columns exist in the table schema."""
         if not self.partition_cols:
             return
-        missing_cols = [
-            col for col in self.partition_cols if col not in table.column_names
-        ]
-        if missing_cols:
+        missing = [col for col in self.partition_cols if col not in table.column_names]
+        if missing:
             raise ValueError(
-                f"Partition columns {missing_cols} not found in table schema. "
-                f"Available columns: {table.column_names}."
+                f"Partition columns {missing} not found. Available: {table.column_names}"
             )
         if self.schema:
             for col in self.partition_cols:
                 if col not in self.schema.names:
-                    raise ValueError(
-                        f"Partition column {col} not found in provided schema."
-                    )
+                    raise ValueError(f"Partition column {col} not in schema")
 
     def _write_table_data(
         self, table: pa.Table, task_idx: int, block_idx: int = 0
@@ -258,57 +247,45 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
     ) -> Dict[tuple, pa.Table]:
         """Partition table by columns efficiently using vectorized operations."""
         from collections import defaultdict
-
         import pyarrow.compute as pc
 
         partitions = {}
         if len(partition_cols) == 1:
-            col_name = partition_cols[0]
-            unique_values = pc.unique(table[col_name])
-            if len(unique_values) > _MAX_PARTITIONS:
+            col = partition_cols[0]
+            unique_vals = pc.unique(table[col])
+            if len(unique_vals) > _MAX_PARTITIONS:
                 raise ValueError(
-                    f"Too many partition values ({len(unique_values)}). "
-                    f"Maximum is {_MAX_PARTITIONS}. Consider using fewer partition columns."
+                    f"Too many partition values ({len(unique_vals)}). Max: {_MAX_PARTITIONS}"
                 )
-            for partition_value in unique_values:
-                partition_value_py = partition_value.as_py()
-                # Validate partition value is safe
-                self._validate_partition_value(partition_value_py)
-                row_mask = pc.equal(table[col_name], partition_value)
-                partitions[(partition_value_py,)] = table.filter(row_mask)
+            for val in unique_vals:
+                val_py = val.as_py()
+                self._validate_partition_value(val_py)
+                partitions[(val_py,)] = table.filter(pc.equal(table[col], val))
         else:
-            partition_values_lists = [table[col].to_pylist() for col in partition_cols]
-            partition_indices = defaultdict(list)
-            for row_idx, partition_tuple in enumerate(zip(*partition_values_lists)):
-                # Validate all partition values in tuple
-                for val in partition_tuple:
-                    self._validate_partition_value(val)
-                partition_indices[partition_tuple].append(row_idx)
-            if len(partition_indices) > _MAX_PARTITIONS:
+            val_lists = [table[col].to_pylist() for col in partition_cols]
+            indices = defaultdict(list)
+            for idx, tup in enumerate(zip(*val_lists)):
+                for v in tup:
+                    self._validate_partition_value(v)
+                indices[tup].append(idx)
+            if len(indices) > _MAX_PARTITIONS:
                 raise ValueError(
-                    f"Too many partition combinations ({len(partition_indices)}). "
-                    f"Maximum is {_MAX_PARTITIONS}."
+                    f"Too many partition combinations ({len(indices)}). Max: {_MAX_PARTITIONS}"
                 )
-            for partition_tuple, row_indices in partition_indices.items():
-                partitions[partition_tuple] = table.take(row_indices)
+            for tup, idxs in indices.items():
+                partitions[tup] = table.take(idxs)
         return partitions
 
     def _validate_partition_value(self, value: Any) -> None:
         """Validate partition value is safe and within limits."""
         if value is None:
-            return  # None is allowed (creates __HIVE_DEFAULT_PARTITION__)
-        value_str = str(value)
-        # Check for path traversal attempts
-        if ".." in value_str or "/" in value_str or "\\" in value_str:
+            return
+        val_str = str(value)
+        if ".." in val_str or "/" in val_str or "\\" in val_str:
+            raise ValueError(f"Partition value contains invalid chars: {value}")
+        if len(val_str) > _MAX_PARTITION_PATH_LENGTH:
             raise ValueError(
-                f"Partition value contains invalid characters: {value}. "
-                "Values cannot contain '..', '/', or '\\'."
-            )
-        # Check length
-        if len(value_str) > _MAX_PARTITION_PATH_LENGTH:
-            raise ValueError(
-                f"Partition value too long ({len(value_str)} chars). "
-                f"Maximum is {_MAX_PARTITION_PATH_LENGTH}."
+                f"Partition value too long ({len(val_str)} chars). Max: {_MAX_PARTITION_PATH_LENGTH}"
             )
 
     def _write_partition(
@@ -370,30 +347,22 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         if not self.partition_cols or not partition_values:
             return "", {}
 
-        partition_path_components = []
-        partition_dict = {}
-        for col_name, col_value in zip(self.partition_cols, partition_values):
-            if col_value is None:
-                # Delta Lake uses __HIVE_DEFAULT_PARTITION__ for null values
-                value_str = "__HIVE_DEFAULT_PARTITION__"
-                partition_dict[col_name] = None
+        parts, part_dict = [], {}
+        for col, val in zip(self.partition_cols, partition_values):
+            if val is None:
+                val_str = "__HIVE_DEFAULT_PARTITION__"
+                part_dict[col] = None
             else:
-                value_str = str(col_value)
-                # URL-encode special characters for path safety
-                value_str = urllib.parse.quote(value_str, safe="")
-                partition_dict[col_name] = str(col_value)
-            partition_path_components.append(f"{col_name}={value_str}")
+                val_str = urllib.parse.quote(str(val), safe="")
+                part_dict[col] = str(val)
+            parts.append(f"{col}={val_str}")
 
-        partition_path = "/".join(partition_path_components) + "/"
-
-        # Validate total path length
-        if len(partition_path) > _MAX_PARTITION_PATH_LENGTH:
+        path = "/".join(parts) + "/"
+        if len(path) > _MAX_PARTITION_PATH_LENGTH:
             raise ValueError(
-                f"Partition path too long ({len(partition_path)} chars). "
-                f"Maximum is {_MAX_PARTITION_PATH_LENGTH}."
+                f"Partition path too long ({len(path)} chars). Max: {_MAX_PARTITION_PATH_LENGTH}"
             )
-
-        return partition_path, partition_dict
+        return path, part_dict
 
     def _write_parquet_file(self, table: pa.Table, file_path: str) -> int:
         """Write PyArrow table to Parquet file and return file size."""
@@ -433,53 +402,34 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         if len(table) == 0:
             return json.dumps({"numRecords": 0})
 
-        statistics = {"numRecords": len(table)}
-        min_values = {}
-        max_values = {}
-        null_counts = {}
-
-        max_stats_cols = 1000
-        cols_to_process = (
-            table.column_names[:max_stats_cols]
-            if len(table.column_names) > max_stats_cols
-            else table.column_names
-        )
-
-        for col_name in cols_to_process:
-            column = table[col_name]
-            null_counts[col_name] = column.null_count
-            if column.null_count < len(column):
-                min_val, max_val = self._compute_column_min_max(column)
-                if min_val is not None:
-                    min_values[col_name] = min_val
-                if max_val is not None:
-                    max_values[col_name] = max_val
-
-        if min_values:
-            statistics["minValues"] = min_values
-        if max_values:
-            statistics["maxValues"] = max_values
-        if null_counts:
-            statistics["nullCount"] = null_counts
-        return json.dumps(statistics)
-
-    def _compute_column_min_max(
-        self, column: pa.Array
-    ) -> tuple[Optional[Any], Optional[Any]]:
-        """Compute min and max values for a single column."""
         import pyarrow.compute as pc
 
-        col_type = column.type
-        if pa.types.is_integer(col_type) or pa.types.is_floating(col_type):
-            return pc.min(column).as_py(), pc.max(column).as_py()
-        elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
-            min_val = pc.min(column).as_py()
-            max_val = pc.max(column).as_py()
-            return (
-                str(min_val) if min_val is not None else None,
-                str(max_val) if max_val is not None else None,
-            )
-        return None, None
+        stats = {"numRecords": len(table)}
+        min_vals, max_vals, null_counts = {}, {}, {}
+
+        for col_name in table.column_names[:1000]:  # Limit to first 1000 cols
+            col = table[col_name]
+            null_counts[col_name] = col.null_count
+            if col.null_count < len(col):
+                col_type = col.type
+                if pa.types.is_integer(col_type) or pa.types.is_floating(col_type):
+                    min_vals[col_name] = pc.min(col).as_py()
+                    max_vals[col_name] = pc.max(col).as_py()
+                elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
+                    min_val = pc.min(col).as_py()
+                    max_val = pc.max(col).as_py()
+                    if min_val is not None:
+                        min_vals[col_name] = str(min_val)
+                    if max_val is not None:
+                        max_vals[col_name] = str(max_val)
+
+        if min_vals:
+            stats["minValues"] = min_vals
+        if max_vals:
+            stats["maxValues"] = max_vals
+        if null_counts:
+            stats["nullCount"] = null_counts
+        return json.dumps(stats)
 
     def on_write_complete(self, write_result: WriteResult[List["AddAction"]]) -> None:
         """Phase 2: Commit all files in single ACID transaction."""
@@ -605,25 +555,21 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             if not self._schemas_compatible(existing_schema, inferred_schema):
                 existing_cols = {f.name: f.type for f in existing_schema}
                 inferred_cols = {f.name: f.type for f in inferred_schema}
-                missing_cols = set(existing_cols.keys()) - set(inferred_cols.keys())
-                extra_cols = set(inferred_cols.keys()) - set(existing_cols.keys())
-                type_mismatches = [
-                    col
-                    for col in existing_cols
-                    if col in inferred_cols and existing_cols[col] != inferred_cols[col]
+                missing = sorted(set(existing_cols) - set(inferred_cols))
+                extra = sorted(set(inferred_cols) - set(existing_cols))
+                mismatches = [
+                    c
+                    for c in existing_cols
+                    if c in inferred_cols and existing_cols[c] != inferred_cols[c]
                 ]
-                error_msg = "Schema mismatch: existing table schema does not match written data schema."
-                if missing_cols:
-                    error_msg += (
-                        f" Missing columns in written data: {sorted(missing_cols)}."
-                    )
-                if extra_cols:
-                    error_msg += (
-                        f" Extra columns in written data: {sorted(extra_cols)}."
-                    )
-                if type_mismatches:
-                    error_msg += f" Type mismatches: {[(c, existing_cols[c], inferred_cols[c]) for c in type_mismatches]}."
-                raise ValueError(error_msg)
+                msg = "Schema mismatch"
+                if missing:
+                    msg += f": missing {missing}"
+                if extra:
+                    msg += f": extra {extra}"
+                if mismatches:
+                    msg += f": type mismatches {mismatches}"
+                raise ValueError(msg)
 
         transaction_mode = "overwrite" if self.mode == WriteMode.OVERWRITE else "append"
         existing_table.create_write_transaction(

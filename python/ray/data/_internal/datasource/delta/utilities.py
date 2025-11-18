@@ -17,60 +17,43 @@ def convert_pyarrow_filter_to_sql(
     if not filters:
         return None
 
-    def format_value(value: Any) -> str:
-        """Format a single value for SQL with proper escaping."""
-        if value is None:
+    def fmt_val(v: Any) -> str:
+        if v is None:
             return "NULL"
-        elif isinstance(value, bool):
-            return "TRUE" if value else "FALSE"
-        elif isinstance(value, str):
-            escaped = value.replace("'", "''")
-            return f"'{escaped}'"
-        elif isinstance(value, (int, float)):
-            return str(value)
-        else:
-            str_value = str(value)
-            escaped = str_value.replace("'", "''")
-            return f"'{escaped}'"
+        elif isinstance(v, bool):
+            return "TRUE" if v else "FALSE"
+        elif isinstance(v, str):
+            return f"'{v.replace(\"'\", \"''\")}'"
+        elif isinstance(v, (int, float)):
+            return str(v)
+        return f"'{str(v).replace(\"'\", \"''\")}'"
 
-    def format_condition(col: str, op: str, value: Any) -> str:
-        """Format a single filter condition as SQL expression."""
+    def fmt_cond(col: str, op: str, val: Any) -> str:
         op_upper = op.upper()
         if op_upper in ("IN", "NOT IN"):
-            if not isinstance(value, (list, tuple)):
-                raise ValueError(
-                    f"IN/NOT IN operator requires list or tuple value, got {type(value).__name__}"
-                )
-            formatted_values = ", ".join(format_value(v) for v in value)
-            return f"{col} {op_upper} ({formatted_values})"
-        return f"{col} {op} {format_value(value)}"
+            if not isinstance(val, (list, tuple)):
+                raise ValueError(f"IN/NOT IN requires list/tuple, got {type(val).__name__}")
+            return f"{col} {op_upper} ({', '.join(fmt_val(v) for v in val)})"
+        return f"{col} {op} {fmt_val(val)}"
 
-    sql_parts = []
-    for filter_item in filters:
-        if not isinstance(filter_item, (tuple, list)):
-            raise ValueError(
-                f"Each filter must be a tuple or list, got {type(filter_item).__name__}"
-            )
+    parts = []
+    for item in filters:
+        if not isinstance(item, (tuple, list)):
+            raise ValueError(f"Filter must be tuple/list, got {type(item).__name__}")
 
-        if len(filter_item) > 0 and isinstance(filter_item[0], (tuple, list)):
-            conditions = []
-            for condition in filter_item:
-                if not isinstance(condition, (tuple, list)) or len(condition) != 3:
-                    raise ValueError(
-                        f"Each condition in conjunctive filter must be a 3-tuple, got {condition}"
-                    )
-                col, op, value = condition
-                conditions.append(format_condition(col, op, value))
-            sql_parts.append(f"({' AND '.join(conditions)})")
+        if len(item) > 0 and isinstance(item[0], (tuple, list)):
+            conds = []
+            for cond in item:
+                if not isinstance(cond, (tuple, list)) or len(cond) != 3:
+                    raise ValueError(f"Condition must be 3-tuple, got {cond}")
+                conds.append(fmt_cond(*cond))
+            parts.append(f"({' AND '.join(conds)})")
         else:
-            if len(filter_item) != 3:
-                raise ValueError(
-                    f"Simple filter must be a 3-tuple, got {len(filter_item)} elements: {filter_item}"
-                )
-            col, op, value = filter_item
-            sql_parts.append(format_condition(col, op, value))
+            if len(item) != 3:
+                raise ValueError(f"Filter must be 3-tuple, got {len(item)} elements")
+            parts.append(fmt_cond(*item))
 
-    return sql_parts[0] if len(sql_parts) == 1 else " OR ".join(sql_parts)
+    return parts[0] if len(parts) == 1 else " OR ".join(parts)
 
 
 def _get_aws_storage_options() -> Dict[str, str]:
