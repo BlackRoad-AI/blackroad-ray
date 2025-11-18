@@ -5,9 +5,11 @@ Delta Lake datasink implementation with two-phase commit for ACID compliance.
 import json
 import logging
 import os
+import posixpath
 import time
+import urllib.parse
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set
 
 import pyarrow as pa
 import pyarrow.fs as pa_fs
@@ -19,8 +21,13 @@ from ray.data._internal.datasource.delta.utilities import (
     try_get_deltatable,
 )
 from ray.data._internal.execution.interfaces import TaskContext
-from ray.data._internal.util import _check_import
+from ray.data._internal.util import (
+    RetryingPyFileSystem,
+    _check_import,
+    _resolve_paths_and_filesystem,
+)
 from ray.data.block import Block, BlockAccessor
+from ray.data.context import DataContext
 from ray.data.datasource.datasink import Datasink, WriteResult
 
 if TYPE_CHECKING:
@@ -28,6 +35,12 @@ if TYPE_CHECKING:
     from deltalake.transaction import AddAction
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of partitions to prevent filesystem issues
+_MAX_PARTITIONS = 10000
+
+# Maximum partition path length (filesystem limit)
+_MAX_PARTITION_PATH_LENGTH = 200
 
 
 class DeltaDatasink(Datasink[List["AddAction"]]):
@@ -45,29 +58,48 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
     ):
         _check_import(self, module="deltalake", package="deltalake")
 
-        self.path = path
+        # Normalize and validate path
+        self.path = self._normalize_path(path)
         self.mode = self._validate_mode(mode)
-        self.partition_cols = partition_cols or []
+        self.partition_cols = self._validate_partition_columns(partition_cols or [])
         self.schema = schema
         self.write_kwargs = write_kwargs
         self._skip_write = False
+        self._written_files: Set[str] = set()  # Track files for cleanup
+        self._existing_table_at_start: Optional["DeltaTable"] = None
 
         # Initialize Delta utilities
         self.delta_utils = DeltaUtilities(
-            path, storage_options=write_kwargs.get("storage_options")
+            self.path, storage_options=write_kwargs.get("storage_options")
         )
         self.storage_options = self.delta_utils.storage_options
 
         # Delta write configuration
         self.delta_write_config = DeltaWriteConfig(
             mode=self.mode,
-            partition_cols=partition_cols,
+            partition_cols=self.partition_cols,
             schema=schema,
             **write_kwargs,
         )
 
-        # Set up filesystem
-        self.filesystem = filesystem or pa_fs.FileSystem.from_uri(path)[0]
+        # Set up filesystem with retry support
+        data_context = DataContext.get_current()
+        if filesystem is None:
+            paths, self.filesystem = _resolve_paths_and_filesystem(self.path, None)
+            assert len(paths) == 1
+            self.path = paths[0]
+        else:
+            self.filesystem = filesystem
+        self.filesystem = RetryingPyFileSystem.wrap(
+            self.filesystem, retryable_errors=data_context.retried_io_errors
+        )
+
+    def _normalize_path(self, path: str) -> str:
+        """Normalize path and validate it's safe."""
+        normalized = posixpath.normpath(path).replace("\\", "/")
+        if ".." in normalized.split("/"):
+            raise ValueError(f"Path contains '..' which is not allowed: {path}")
+        return normalized
 
     def _validate_mode(self, mode: str) -> WriteMode:
         """Validate and return WriteMode."""
@@ -81,18 +113,36 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             )
         return WriteMode(mode)
 
+    def _validate_partition_columns(self, partition_cols: List[str]) -> List[str]:
+        """Validate partition column names are safe."""
+        if len(partition_cols) > 10:
+            raise ValueError(
+                f"Too many partition columns ({len(partition_cols)}). Maximum is 10."
+            )
+        for col in partition_cols:
+            if not col or not isinstance(col, str):
+                raise ValueError(f"Invalid partition column name: {col}")
+            if "/" in col or "\\" in col or ".." in col:
+                raise ValueError(
+                    f"Partition column name contains invalid characters: {col}"
+                )
+        return partition_cols
+
     def on_write_start(self) -> None:
         """Check ERROR and IGNORE modes before writing files."""
         _check_import(self, module="deltalake", package="deltalake")
 
-        existing_table = try_get_deltatable(self.path, self.storage_options)
+        # Store table state at start to detect race conditions
+        self._existing_table_at_start = try_get_deltatable(
+            self.path, self.storage_options
+        )
 
-        if self.mode == WriteMode.ERROR and existing_table:
+        if self.mode == WriteMode.ERROR and self._existing_table_at_start:
             raise ValueError(
                 f"Delta table already exists at {self.path}. Use mode='append' or 'overwrite'."
             )
 
-        if self.mode == WriteMode.IGNORE and existing_table:
+        if self.mode == WriteMode.IGNORE and self._existing_table_at_start:
             logger.info(
                 f"Delta table already exists at {self.path}. Skipping write due to mode='ignore'."
             )
@@ -111,21 +161,85 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
 
         _check_import(self, module="deltalake", package="deltalake")
 
-        combined_table = self._convert_blocks_to_table(blocks)
-        if combined_table is None:
-            return []
-
-        self._validate_partition_columns(combined_table)
-        return self._write_table_data(combined_table, ctx.task_idx)
-
-    def _convert_blocks_to_table(self, blocks: Iterable[Block]) -> Optional[pa.Table]:
-        """Convert Ray Data blocks to a single PyArrow table."""
-        tables = []
+        # Process blocks individually to avoid memory issues
+        all_actions = []
+        block_idx = 0
         for block in blocks:
             block_accessor = BlockAccessor.for_block(block)
-            if block_accessor.num_rows() > 0:
-                tables.append(block_accessor.to_arrow())
-        return pa.concat_tables(tables) if tables else None
+            if block_accessor.num_rows() == 0:
+                continue
+
+            table = block_accessor.to_arrow()
+            # Validate schema before writing
+            self._validate_table_schema(table)
+            self._validate_partition_columns(table)
+
+            # Write this block's data
+            actions = self._write_table_data(table, ctx.task_idx, block_idx)
+            all_actions.extend([a for a in actions if a is not None])
+            block_idx += 1
+
+        return all_actions
+
+    def _validate_table_schema(self, table: pa.Table) -> None:
+        """Validate table schema matches expected schema if provided."""
+        if self.schema:
+            # Check column names match
+            table_cols = set(table.column_names)
+            schema_cols = set(self.schema.names)
+            missing_cols = schema_cols - table_cols
+
+            if missing_cols:
+                raise ValueError(
+                    f"Table missing required columns from schema: {sorted(missing_cols)}. "
+                    f"Table columns: {sorted(table_cols)}"
+                )
+
+            # Validate types match for common columns (excluding partition cols)
+            for field in self.schema:
+                if (
+                    field.name in table.column_names
+                    and field.name not in self.partition_cols
+                ):
+                    table_type = table[field.name].type
+                    if not self._types_compatible(field.type, table_type):
+                        raise ValueError(
+                            f"Type mismatch for column '{field.name}': "
+                            f"schema expects {field.type}, table has {table_type}"
+                        )
+
+    def _types_compatible(
+        self, expected_type: pa.DataType, actual_type: pa.DataType
+    ) -> bool:
+        """Check if two PyArrow types are compatible for writing."""
+        # Exact match
+        if expected_type == actual_type:
+            return True
+
+        # Allow some type promotions (int32 -> int64, float32 -> float64)
+        if pa.types.is_integer(expected_type) and pa.types.is_integer(actual_type):
+            # Allow smaller ints to be promoted to larger ints
+            expected_width = (
+                expected_type.bit_width if hasattr(expected_type, "bit_width") else 64
+            )
+            actual_width = (
+                actual_type.bit_width if hasattr(actual_type, "bit_width") else 64
+            )
+            return actual_width <= expected_width
+
+        if pa.types.is_floating(expected_type) and pa.types.is_floating(actual_type):
+            # Allow float32 -> float64
+            return True
+
+        # String types are compatible
+        if (
+            pa.types.is_string(expected_type) or pa.types.is_large_string(expected_type)
+        ) and (
+            pa.types.is_string(actual_type) or pa.types.is_large_string(actual_type)
+        ):
+            return True
+
+        return False
 
     def _validate_partition_columns(self, table: pa.Table) -> None:
         """Validate that all partition columns exist in the table schema."""
@@ -136,18 +250,30 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         ]
         if missing_cols:
             raise ValueError(
-                f"Partition columns {missing_cols} not found in table schema. Available columns: {table.column_names}."
+                f"Partition columns {missing_cols} not found in table schema. "
+                f"Available columns: {table.column_names}."
             )
+        # Validate schema matches if provided
+        if self.schema:
+            for col in self.partition_cols:
+                if col not in self.schema.names:
+                    raise ValueError(
+                        f"Partition column {col} not found in provided schema."
+                    )
 
-    def _write_table_data(self, table: pa.Table, task_idx: int) -> List["AddAction"]:
+    def _write_table_data(
+        self, table: pa.Table, task_idx: int, block_idx: int = 0
+    ) -> List["AddAction"]:
         """Write table data as partitioned or non-partitioned Parquet files."""
         if self.partition_cols:
             partitioned_tables = self._partition_table(table, self.partition_cols)
             return [
-                self._write_partition(partition_table, partition_values, task_idx)
+                self._write_partition(
+                    partition_table, partition_values, task_idx, block_idx
+                )
                 for partition_values, partition_table in partitioned_tables.items()
             ]
-        return [self._write_partition(table, (), task_idx)]
+        return [self._write_partition(table, (), task_idx, block_idx)]
 
     def _partition_table(
         self, table: pa.Table, partition_cols: List[str]
@@ -160,32 +286,79 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         partitions = {}
         if len(partition_cols) == 1:
             col_name = partition_cols[0]
-            for partition_value in pc.unique(table[col_name]):
+            unique_values = pc.unique(table[col_name])
+            if len(unique_values) > _MAX_PARTITIONS:
+                raise ValueError(
+                    f"Too many partition values ({len(unique_values)}). "
+                    f"Maximum is {_MAX_PARTITIONS}. Consider using fewer partition columns."
+                )
+            for partition_value in unique_values:
                 partition_value_py = partition_value.as_py()
+                # Validate partition value is safe
+                self._validate_partition_value(partition_value_py)
                 row_mask = pc.equal(table[col_name], partition_value)
                 partitions[(partition_value_py,)] = table.filter(row_mask)
         else:
             partition_values_lists = [table[col].to_pylist() for col in partition_cols]
             partition_indices = defaultdict(list)
             for row_idx, partition_tuple in enumerate(zip(*partition_values_lists)):
+                # Validate all partition values in tuple
+                for val in partition_tuple:
+                    self._validate_partition_value(val)
                 partition_indices[partition_tuple].append(row_idx)
+            if len(partition_indices) > _MAX_PARTITIONS:
+                raise ValueError(
+                    f"Too many partition combinations ({len(partition_indices)}). "
+                    f"Maximum is {_MAX_PARTITIONS}."
+                )
             for partition_tuple, row_indices in partition_indices.items():
                 partitions[partition_tuple] = table.take(row_indices)
         return partitions
+
+    def _validate_partition_value(self, value: Any) -> None:
+        """Validate partition value is safe and within limits."""
+        if value is None:
+            return  # None is allowed (creates __HIVE_DEFAULT_PARTITION__)
+        value_str = str(value)
+        # Check for path traversal attempts
+        if ".." in value_str or "/" in value_str or "\\" in value_str:
+            raise ValueError(
+                f"Partition value contains invalid characters: {value}. "
+                "Values cannot contain '..', '/', or '\\'."
+            )
+        # Check length
+        if len(value_str) > _MAX_PARTITION_PATH_LENGTH:
+            raise ValueError(
+                f"Partition value too long ({len(value_str)} chars). "
+                f"Maximum is {_MAX_PARTITION_PATH_LENGTH}."
+            )
 
     def _write_partition(
         self,
         table: pa.Table,
         partition_values: tuple,
         task_idx: int,
+        block_idx: int = 0,
     ) -> "AddAction":
         """Write a single partition to Parquet file and create AddAction metadata."""
         from deltalake.transaction import AddAction
 
-        filename = self._generate_filename(task_idx)
+        # Skip empty tables
+        if len(table) == 0:
+            return None
+
+        filename = self._generate_filename(task_idx, block_idx)
         partition_path, partition_dict = self._build_partition_path(partition_values)
         relative_path = partition_path + filename
+
+        # Validate path is within table directory
+        self._validate_file_path(relative_path)
+
         full_path = os.path.join(self.path, relative_path)
+
+        # Track file for cleanup on failure
+        self._written_files.add(full_path)
+
         file_size = self._write_parquet_file(table, full_path)
         file_statistics = self._compute_statistics(table)
 
@@ -198,9 +371,22 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             stats=file_statistics,
         )
 
-    def _generate_filename(self, task_idx: int) -> str:
+    def _generate_filename(self, task_idx: int, block_idx: int = 0) -> str:
         """Generate unique Parquet filename."""
-        return f"part-{task_idx:05d}-{uuid.uuid4().hex}.parquet"
+        # Use UUID4 for uniqueness, task_idx and block_idx for debugging
+        unique_id = uuid.uuid4().hex
+        return f"part-{task_idx:05d}-{block_idx:05d}-{unique_id}.parquet"
+
+    def _validate_file_path(self, relative_path: str) -> None:
+        """Validate file path is safe and within table directory."""
+        # Normalize path
+        normalized = posixpath.normpath(relative_path).replace("\\", "/")
+        # Check for path traversal
+        if normalized.startswith("../") or "/../" in normalized:
+            raise ValueError(f"Invalid file path: {relative_path} (contains '..')")
+        # Check path length
+        if len(normalized) > 500:  # Reasonable limit
+            raise ValueError(f"File path too long: {relative_path}")
 
     def _build_partition_path(
         self, partition_values: tuple
@@ -212,25 +398,52 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         partition_path_components = []
         partition_dict = {}
         for col_name, col_value in zip(self.partition_cols, partition_values):
-            value_str = "" if col_value is None else str(col_value)
+            if col_value is None:
+                # Delta Lake uses __HIVE_DEFAULT_PARTITION__ for null values
+                value_str = "__HIVE_DEFAULT_PARTITION__"
+                partition_dict[col_name] = None
+            else:
+                value_str = str(col_value)
+                # URL-encode special characters for path safety
+                value_str = urllib.parse.quote(value_str, safe="")
+                partition_dict[col_name] = str(col_value)
             partition_path_components.append(f"{col_name}={value_str}")
-            partition_dict[col_name] = None if col_value is None else str(col_value)
-        return "/".join(partition_path_components) + "/", partition_dict
+
+        partition_path = "/".join(partition_path_components) + "/"
+
+        # Validate total path length
+        if len(partition_path) > _MAX_PARTITION_PATH_LENGTH:
+            raise ValueError(
+                f"Partition path too long ({len(partition_path)} chars). "
+                f"Maximum is {_MAX_PARTITION_PATH_LENGTH}."
+            )
+
+        return partition_path, partition_dict
 
     def _write_parquet_file(self, table: pa.Table, file_path: str) -> int:
         """Write PyArrow table to Parquet file and return file size."""
         table_to_write = self._prepare_table_for_write(table)
-        self._ensure_parent_directory(file_path)
 
+        compression = self.write_kwargs.get("compression", "snappy")
+        valid_compressions = ["snappy", "gzip", "brotli", "zstd", "lz4", "none"]
+        if compression not in valid_compressions:
+            raise ValueError(
+                f"Invalid compression '{compression}'. Supported: {valid_compressions}"
+            )
+
+        self._ensure_parent_directory(file_path)
         pq.write_table(
             table_to_write,
             file_path,
             filesystem=self.filesystem,
-            compression=self.write_kwargs.get("compression", "snappy"),
+            compression=compression,
             write_statistics=True,
         )
 
-        return self.filesystem.get_file_info(file_path).size
+        file_info = self.filesystem.get_file_info(file_path)
+        if file_info.size == 0:
+            raise RuntimeError(f"Written file is empty: {file_path}")
+        return file_info.size
 
     def _prepare_table_for_write(self, table: pa.Table) -> pa.Table:
         """Prepare table for writing by removing partition columns."""
@@ -239,21 +452,27 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
     def _ensure_parent_directory(self, file_path: str) -> None:
         """Create parent directory for file if it doesn't exist."""
         parent_dir = os.path.dirname(file_path)
-        if not parent_dir:
-            return
-        try:
+        if parent_dir:
             self.filesystem.create_dir(parent_dir, recursive=True)
-        except Exception:
-            pass
 
     def _compute_statistics(self, table: pa.Table) -> str:
         """Compute file-level statistics for Delta Lake transaction log."""
+        if len(table) == 0:
+            return json.dumps({"numRecords": 0})
+
         statistics = {"numRecords": len(table)}
         min_values = {}
         max_values = {}
         null_counts = {}
 
-        for col_name in table.column_names:
+        max_stats_cols = 1000
+        cols_to_process = (
+            table.column_names[:max_stats_cols]
+            if len(table.column_names) > max_stats_cols
+            else table.column_names
+        )
+
+        for col_name in cols_to_process:
             column = table[col_name]
             null_counts[col_name] = column.null_count
             if column.null_count < len(column):
@@ -277,25 +496,41 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         """Compute min and max values for a single column."""
         import pyarrow.compute as pc
 
-        try:
-            col_type = column.type
-            if pa.types.is_integer(col_type) or pa.types.is_floating(col_type):
-                return pc.min(column).as_py(), pc.max(column).as_py()
-            elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
-                min_val = pc.min(column).as_py()
-                max_val = pc.max(column).as_py()
-                return (
-                    str(min_val) if min_val is not None else None,
-                    str(max_val) if max_val is not None else None,
-                )
-            return None, None
-        except Exception:
-            return None, None
+        col_type = column.type
+        if pa.types.is_integer(col_type) or pa.types.is_floating(col_type):
+            return pc.min(column).as_py(), pc.max(column).as_py()
+        elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
+            min_val = pc.min(column).as_py()
+            max_val = pc.max(column).as_py()
+            return (
+                str(min_val) if min_val is not None else None,
+                str(max_val) if max_val is not None else None,
+            )
+        return None, None
 
     def on_write_complete(self, write_result: WriteResult[List["AddAction"]]) -> None:
         """Phase 2: Commit all files in single ACID transaction."""
         all_file_actions = self._collect_file_actions(write_result)
+
+        # Validate all file actions before committing
+        self._validate_file_actions(all_file_actions)
+
+        # Check for race condition: table created between on_write_start and now
         existing_table = try_get_deltatable(self.path, self.storage_options)
+
+        # Detect race condition
+        if (
+            self._existing_table_at_start is None
+            and existing_table is not None
+            and self.mode == WriteMode.ERROR
+        ):
+            # Clean up written files
+            self._cleanup_written_files()
+            raise ValueError(
+                f"Race condition detected: Delta table was created at {self.path} "
+                f"after write started. Files have been written but not committed to "
+                f"the transaction log. Use mode='append' or 'overwrite' if concurrent writes are expected."
+            )
 
         if not all_file_actions:
             if self.schema and not existing_table:
@@ -313,16 +548,37 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             self._commit_to_existing_table(existing_table, all_file_actions)
         else:
             self._create_table_with_files(all_file_actions)
+        self._written_files.clear()
 
     def _collect_file_actions(
         self, write_result: WriteResult[List["AddAction"]]
     ) -> List["AddAction"]:
         """Collect all AddAction objects from distributed write tasks."""
-        return [
+        actions = [
             action
             for task_file_actions in write_result.write_returns
             for action in task_file_actions
+            if action is not None  # Filter None actions
         ]
+        # Check for duplicate paths
+        paths = [action.path for action in actions]
+        if len(paths) != len(set(paths)):
+            duplicates = [p for p in paths if paths.count(p) > 1]
+            raise ValueError(
+                f"Duplicate file paths detected in AddActions: {set(duplicates)}"
+            )
+        return actions
+
+    def _validate_file_actions(self, file_actions: List["AddAction"]) -> None:
+        """Validate file actions before committing."""
+        if not file_actions:
+            return
+
+        for action in file_actions:
+            full_path = os.path.join(self.path, action.path)
+            file_info = self.filesystem.get_file_info(full_path)
+            if file_info.type == pa_fs.FileType.NotFound:
+                raise ValueError(f"File does not exist: {full_path}")
 
     def _create_empty_table(self) -> None:
         """Create empty Delta table with specified schema."""
@@ -390,8 +646,34 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             )
             return
 
+        # Validate schema compatibility before committing
+        existing_schema = existing_table.schema().to_pyarrow()
+        if file_actions:
+            inferred_schema = self._infer_schema(file_actions)
+            if not self._schemas_compatible(existing_schema, inferred_schema):
+                existing_cols = {f.name: f.type for f in existing_schema}
+                inferred_cols = {f.name: f.type for f in inferred_schema}
+                missing_cols = set(existing_cols.keys()) - set(inferred_cols.keys())
+                extra_cols = set(inferred_cols.keys()) - set(existing_cols.keys())
+                type_mismatches = [
+                    col
+                    for col in existing_cols
+                    if col in inferred_cols and existing_cols[col] != inferred_cols[col]
+                ]
+                error_msg = "Schema mismatch: existing table schema does not match written data schema."
+                if missing_cols:
+                    error_msg += (
+                        f" Missing columns in written data: {sorted(missing_cols)}."
+                    )
+                if extra_cols:
+                    error_msg += (
+                        f" Extra columns in written data: {sorted(extra_cols)}."
+                    )
+                if type_mismatches:
+                    error_msg += f" Type mismatches: {[(c, existing_cols[c], inferred_cols[c]) for c in type_mismatches]}."
+                raise ValueError(error_msg)
+
         transaction_mode = "overwrite" if self.mode == WriteMode.OVERWRITE else "append"
-        # create_write_transaction commits internally and returns None
         existing_table.create_write_transaction(
             actions=file_actions,
             mode=transaction_mode,
@@ -404,22 +686,50 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             f"Committed {len(file_actions)} files to Delta table at {self.path} (mode={transaction_mode})"
         )
 
+    def _schemas_compatible(self, schema1: pa.Schema, schema2: pa.Schema) -> bool:
+        """Check if two schemas are compatible for append operations."""
+        # For append, new schema must be subset or compatible
+        # For now, check if all columns in schema2 exist in schema1 with compatible types
+        if len(schema2) > len(schema1):
+            return False  # Cannot add columns in append mode
+
+        schema1_dict = {f.name: f.type for f in schema1}
+        for field in schema2:
+            if field.name not in schema1_dict:
+                return False
+            # Type compatibility check
+            if not self._types_compatible(schema1_dict[field.name], field.type):
+                return False
+        return True
+
     def _infer_schema(self, add_actions: List["AddAction"]) -> pa.Schema:
         """Infer schema from first file and partition columns."""
         if self.schema:
             return self.schema
 
-        first_file = os.path.join(self.path, add_actions[0].path)
-        file_obj = self.filesystem.open_input_file(first_file)
-        parquet_file = pq.ParquetFile(file_obj)
-        schema = parquet_file.schema_arrow
+        if not add_actions:
+            raise ValueError("Cannot infer schema from empty file list")
 
-        if self.partition_cols:
-            for col in self.partition_cols:
-                if col in add_actions[0].partition_values:
-                    val = add_actions[0].partition_values[col]
-                    col_type = self._infer_partition_type(val)
-                    schema = schema.append(pa.field(col, col_type))
+        first_file = os.path.join(self.path, add_actions[0].path)
+        file_obj = None
+        try:
+            file_obj = self.filesystem.open_input_file(first_file)
+            parquet_file = pq.ParquetFile(file_obj)
+            schema = parquet_file.schema_arrow
+
+            if len(schema) == 0:
+                raise ValueError(f"Cannot infer schema from empty file: {first_file}")
+
+            if self.partition_cols:
+                for col in self.partition_cols:
+                    if col not in schema.names:
+                        if col in add_actions[0].partition_values:
+                            val = add_actions[0].partition_values[col]
+                            col_type = self._infer_partition_type(val)
+                            schema = schema.append(pa.field(col, col_type))
+        finally:
+            if file_obj is not None:
+                file_obj.close()
 
         return schema
 
@@ -509,10 +819,29 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             raise ValueError(f"Unsupported PyArrow type for Delta Lake: {pa_type}")
 
     def on_write_failed(self, error: Exception) -> None:
-        """Handle write failure."""
+        """Handle write failure - cleanup orphaned files."""
         logger.error(
-            f"Delta write failed for {self.path}: {error}. Uncommitted files will be cleaned by Delta vacuum."
+            f"Delta write failed for {self.path}: {error}. Cleaning up uncommitted files."
         )
+        self._cleanup_written_files()
+
+    def _cleanup_written_files(self) -> None:
+        """Clean up all written files that weren't committed."""
+        if not self._written_files:
+            return
+
+        logger.info(f"Cleaning up {len(self._written_files)} uncommitted files")
+        for file_path in self._written_files:
+            try:
+                if (
+                    self.filesystem.get_file_info(file_path).type
+                    != pa_fs.FileType.NotFound
+                ):
+                    self.filesystem.delete_file(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup file {file_path}: {e}")
+
+        self._written_files.clear()
 
     @property
     def supports_distributed_writes(self) -> bool:
