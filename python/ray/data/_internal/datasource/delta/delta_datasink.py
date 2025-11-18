@@ -1,5 +1,13 @@
-"""
-Delta Lake datasink implementation with two-phase commit for ACID compliance.
+"""Delta Lake datasink implementation with two-phase commit for ACID compliance.
+
+This module implements write operations for Delta Lake tables using Ray Data's
+Datasink interface. It provides ACID-compliant writes using a two-phase commit
+protocol where files are written first, then committed atomically to the Delta
+Lake transaction log.
+
+Delta Lake: https://delta.io/
+deltalake Python library: https://github.com/delta-io/delta-rs
+PyArrow: https://arrow.apache.org/docs/python/
 """
 
 import json
@@ -43,7 +51,18 @@ _MAX_PARTITION_PATH_LENGTH = 200
 
 
 class DeltaDatasink(Datasink[List["AddAction"]]):
-    """Ray Data datasink for Delta Lake tables using two-phase commit."""
+    """Ray Data datasink for Delta Lake tables using two-phase commit.
+
+    This datasink implements ACID-compliant writes to Delta Lake tables by:
+    1. Writing Parquet files to storage (Phase 1)
+    2. Committing file metadata to Delta transaction log atomically (Phase 2)
+
+    Supports distributed writes, partitioning, schema validation, and multiple
+    write modes (append, overwrite, error, ignore).
+
+    Delta Lake specification: https://delta.io/
+    deltalake Python API: https://delta-io.github.io/delta-rs/python/
+    """
 
     def __init__(
         self,
@@ -700,7 +719,13 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         return json.dumps({"type": "struct", "fields": fields})
 
     def _pyarrow_type_to_delta_type(self, pa_type: pa.DataType) -> str:
-        """Convert PyArrow data type to Delta Lake type string."""
+        """Convert PyArrow data type to Delta Lake type string.
+
+        Note: uint64 values exceeding int64 max (9223372036854775807) are converted
+        to decimal(20,0) to prevent overflow. Delta Lake doesn't natively support
+        unsigned integers, so large uint64 values require decimal type.
+        See: https://delta-io.github.io/delta-rs/python/api/deltalake.schema.html
+        """
         if pa.types.is_int8(pa_type):
             return "byte"
         elif pa.types.is_int16(pa_type):
@@ -716,7 +741,8 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         elif pa.types.is_uint32(pa_type):
             return "long"
         elif pa.types.is_uint64(pa_type):
-            return "long"
+            # uint64 can exceed int64 max (9223372036854775807), use decimal to prevent overflow
+            return "decimal(20,0)"
         elif pa.types.is_float32(pa_type):
             return "float"
         elif pa.types.is_float64(pa_type):
