@@ -582,6 +582,10 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             raise RuntimeError(
                 f"Failed to write Parquet file {file_path}: {last_err}"
             ) from last_err
+        raise RuntimeError(
+            f"Failed to write Parquet file {file_path}: no attempts executed "
+            f"(attempts={attempts})"
+        )
 
     def _prepare_table_for_write(self, table: pa.Table) -> pa.Table:
         """Prepare table for writing by removing partition columns."""
@@ -612,6 +616,7 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             return json.dumps({"numRecords": 0})
 
         import pyarrow.compute as pc
+        import math
 
         stats = {"numRecords": len(table)}
         min_vals, max_vals, null_counts = {}, {}, {}
@@ -623,8 +628,17 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
             if col.null_count < len(col):
                 col_type = col.type
                 if pa.types.is_integer(col_type) or pa.types.is_floating(col_type):
-                    min_vals[col_name] = pc.min(col).as_py()
-                    max_vals[col_name] = pc.max(col).as_py()
+                    min_val = pc.min(col).as_py()
+                    max_val = pc.max(col).as_py()
+                    # JSON cannot encode inf/-inf; drop stats if non-finite
+                    if isinstance(min_val, float) and not math.isfinite(min_val):
+                        min_val = None
+                    if isinstance(max_val, float) and not math.isfinite(max_val):
+                        max_val = None
+                    if min_val is not None:
+                        min_vals[col_name] = min_val
+                    if max_val is not None:
+                        max_vals[col_name] = max_val
                 elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
                     min_val = pc.min(col).as_py()
                     max_val = pc.max(col).as_py()
@@ -1115,3 +1129,6 @@ def _get_file_info_with_retry(
             last_err = exc
     if last_err is not None:
         raise last_err
+    raise RuntimeError(
+        f"Failed to get file info for {path}: no attempts executed (retries={retries})"
+    )
