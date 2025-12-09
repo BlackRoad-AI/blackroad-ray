@@ -4,6 +4,8 @@ Delta Lake utility functions for credential management and table operations.
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+import pyarrow as pa
+
 if TYPE_CHECKING:
     from deltalake import DeltaTable
 
@@ -101,6 +103,25 @@ def try_get_deltatable(
         # Table not found or unreachable with the provided options; callers treat this as
         # "table does not exist". Other errors should surface to fail fast.
         return None
+
+
+def to_pyarrow_schema(delta_schema: Any) -> pa.Schema:
+    """Convert a Delta Lake schema object to a PyArrow schema.
+
+    delta-rs schema objects may expose either ``to_pyarrow`` (newer) or
+    ``to_arrow`` (older) helpers. Fall back to returning the input if it
+    is already a PyArrow schema.
+    """
+    if isinstance(delta_schema, pa.Schema):
+        return delta_schema
+    if hasattr(delta_schema, "to_pyarrow"):
+        return delta_schema.to_pyarrow()
+    if hasattr(delta_schema, "to_arrow"):
+        return delta_schema.to_arrow()
+    raise AttributeError(
+        "Delta schema object does not support to_pyarrow() or to_arrow(). "
+        f"Type: {type(delta_schema).__name__}"
+    )
 
 
 def get_storage_options(

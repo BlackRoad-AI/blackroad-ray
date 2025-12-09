@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 from ray.data._internal.datasource.delta.config import WriteMode
 from ray.data._internal.datasource.delta.utilities import (
     get_storage_options,
+    to_pyarrow_schema,
     try_get_deltatable,
 )
 from ray.data._internal.execution.interfaces import TaskContext
@@ -824,7 +825,7 @@ class DeltaDatasink(Datasink[List["AddAction"]]):
         deltalake write transaction: https://delta-io.github.io/delta-rs/python/api/deltalake.table.html#deltalake.table.DeltaTable.create_write_transaction
         """
         # Always validate schema compatibility, even for empty writes
-        existing_schema = existing_table.schema().to_pyarrow()
+        existing_schema = to_pyarrow_schema(existing_table.schema())
         if file_actions:
             inferred_schema = self._infer_schema(file_actions)
         elif self.schema:

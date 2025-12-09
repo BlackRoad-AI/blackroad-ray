@@ -5,6 +5,8 @@ Delta Lake datasource implementation for reading Delta tables.
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+from ray.data._internal.datasource.delta.utilities import to_pyarrow_schema
+
 from ray.data._internal.util import _check_import, _is_local_scheme
 from ray.data.datasource import Datasource, ReadTask
 from ray.data.datasource.file_meta_provider import FileMetadataProvider
@@ -144,7 +146,7 @@ class DeltaDatasource(Datasource):
 
     def get_table_schema(self):
         """Get Delta table schema."""
-        return self.delta_table.schema().to_pyarrow()
+        return to_pyarrow_schema(self.delta_table.schema())
 
     def get_table_metadata(self) -> Dict[str, Any]:
         """Get Delta table metadata."""
@@ -153,7 +155,7 @@ class DeltaDatasource(Datasource):
         return {
             "version": dt.version(),
             "num_files": len(file_paths),
-            "schema": dt.schema().to_pyarrow(),
+            "schema": to_pyarrow_schema(dt.schema()),
             "partition_columns": dt.metadata().partition_columns,
         }
 
